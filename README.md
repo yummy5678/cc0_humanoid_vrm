@@ -36,10 +36,7 @@ VRM0ヒューマノイド仕様に準拠した55ボーン：
 
 `cc0_humanoid.vrm` をVRM対応アプリで読み込んでください：
 
-- [VRoid Hub](https://hub.vroid.com/)
-- [VRM Viewer](https://vrm-viewer.glitch.me/)
-- [UniVRM](https://github.com/vrm-c/UniVRM)（Unity）
-- [three-vrm](https://github.com/pixiv/three-vrm)（Three.js）
+- [3dRetarget – VRM Viewer](https://3dretarget.com/vrm-viewer)
 
 ## 技術仕様
 
