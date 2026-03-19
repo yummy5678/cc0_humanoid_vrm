@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CC0 Humanoid Base</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #888; display: flex; flex-direction: column; height: 100dvh; font-family: monospace; }
+  #wrap { position: relative; flex: 1; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #hud {
+    position: absolute; top: 12px; left: 12px;
+    color: #fff; font-size: 11px; line-height: 1.8;
+    text-shadow: 0 1px 3px #000a;
+    pointer-events: none;
+  }
+  #hud b { color: #ffa040; }
+  #err {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    color: #f66; font-size: 13px; text-align: center;
+  }
+  footer {
+    background: #222; color: #999; font-size: 10px;
+    padding: 6px 12px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px;
+  }
+  footer a { color: #999; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="hud"></div>
+  <div id="err"></div>
+</div>
+<footer>
+  <span>DRAG: rotate · SCROLL: zoom · RIGHT DRAG: pan · <b style="color:#ffa040">B</b>: toggle bones</span>
+  <span>CC0 · Claude (Anthropic) · <a href="https://creativecommons.org/publicdomain/zero/1.0/">CC0 1.0</a></span>
+</footer>
+<script>
+// ── GLBパーサー ───────────────────────────────────────────────
+async function loadGLB(url) {
+  const buf = await fetch(url).then(r => r.arrayBuffer());
+  const dv  = new DataView(buf);
+  if (dv.getUint32(0,true) !== 0x46546C67) throw new Error('Not a GLB file');
+  const jsonLen  = dv.getUint32(12,true);
+  const jsonText = new TextDecoder().decode(new Uint8Array(buf,20,jsonLen));
+  const json     = JSON.parse(jsonText);
+  const bin      = buf.slice(20+jsonLen+8);
+  return {json,bin};
+}
+function getAccessor(json,bin,idx) {
+  const acc=json.accessors[idx], bv=json.bufferViews[acc.bufferView];
+  const off=(bv.byteOffset||0)+(acc.byteOffset||0);
+  const n={SCALAR:1,VEC2:2,VEC3:3,VEC4:4,MAT4:16}[acc.type];
+  const T={5120:Int8Array,5121:Uint8Array,5122:Int16Array,
+           5123:Uint16Array,5125:Uint32Array,5126:Float32Array}[acc.componentType];
+  return new T(bin,off,acc.count*n);
+}
+
+// ── WebGL初期化 ──────────────────────────────────────────────
+const canvas=document.getElementById('c');
+const gl=canvas.getContext('webgl')||canvas.getContext('experimental-webgl');
+if (!gl) document.getElementById('err').textContent='WebGL not supported';
+
+function compileShader(type,src) {
+  const sh=gl.createShader(type);
+  gl.shaderSource(sh,src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+function makeProgram(vs,fs) {
+  const p=gl.createProgram();
+  gl.attachShader(p,compileShader(gl.VERTEX_SHADER,vs));
+  gl.attachShader(p,compileShader(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(p); return p;
+}
+
+const meshProg = makeProgram(
+`attribute vec3 aPos,aNorm; uniform mat4 uMVP,uModel; varying vec3 vN;
+ void main(){ vN=mat3(uModel[0].xyz,uModel[1].xyz,uModel[2].xyz)*aNorm;
+              gl_Position=uMVP*vec4(aPos,1.0); }`,
+`precision mediump float; varying vec3 vN; uniform vec3 uLight,uColor;
+ void main(){ float d=max(dot(normalize(vN),uLight),0.0);
+              gl_FragColor=vec4(uColor*(0.35+0.65*d),1.0); }`
+);
+const boneProg = makeProgram(
+`attribute vec3 aPos; uniform mat4 uMVP;
+ void main(){ gl_Position=uMVP*vec4(aPos,1.0); }`,
+`precision mediump float; uniform vec3 uColor;
+ void main(){ gl_FragColor=vec4(uColor,1.0); }`
+);
+
+const mL={
+  pos:gl.getAttribLocation(meshProg,'aPos'), norm:gl.getAttribLocation(meshProg,'aNorm'),
+  mvp:gl.getUniformLocation(meshProg,'uMVP'), model:gl.getUniformLocation(meshProg,'uModel'),
+  light:gl.getUniformLocation(meshProg,'uLight'), color:gl.getUniformLocation(meshProg,'uColor'),
+};
+const bL={
+  pos:gl.getAttribLocation(boneProg,'aPos'),
+  mvp:gl.getUniformLocation(boneProg,'uMVP'),
+  color:gl.getUniformLocation(boneProg,'uColor'),
+};
+
+// ── 行列 ─────────────────────────────────────────────────────
+const vd=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const vs=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const vc=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const vn=a=>{const l=Math.sqrt(vd(a,a));return[a[0]/l,a[1]/l,a[2]/l];};
+const m4={
+  id:()=>new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]),
+  mul(a,b){const r=new Float32Array(16);for(let i=0;i<4;i++)for(let j=0;j<4;j++)for(let k=0;k<4;k++)r[j*4+i]+=a[k*4+i]*b[j*4+k];return r;},
+  persp(fov,asp,n,f){const t=Math.tan(fov/2),r=new Float32Array(16);r[0]=1/(asp*t);r[5]=1/t;r[10]=-(f+n)/(f-n);r[11]=-1;r[14]=-2*f*n/(f-n);return r;},
+  lookAt(e,c,u){const f=vn(vs(c,e)),s=vn(vc(f,u)),uu=vc(s,f),r=new Float32Array(16);r[0]=s[0];r[1]=uu[0];r[2]=-f[0];r[4]=s[1];r[5]=uu[1];r[6]=-f[1];r[8]=s[2];r[9]=uu[2];r[10]=-f[2];r[12]=-vd(s,e);r[13]=-vd(uu,e);r[14]=vd(f,e);r[15]=1;return r;},
+  rotY(a){const c=Math.cos(a),s=Math.sin(a),r=m4.id();r[0]=c;r[2]=s;r[8]=-s;r[10]=c;return r;},
+  rotX(a){const c=Math.cos(a),s=Math.sin(a),r=m4.id();r[5]=c;r[6]=-s;r[9]=s;r[10]=c;return r;},
+};
+
+function trsToMat(node) {
+  const t=node.translation||[0,0,0],q=node.rotation||[0,0,0,1],s=node.scale||[1,1,1];
+  const [x,y,z,w]=q;
+  const rm=new Float32Array([
+    1-2*(y*y+z*z),2*(x*y+z*w),  2*(x*z-y*w),  0,
+    2*(x*y-z*w),  1-2*(x*x+z*z),2*(y*z+x*w),  0,
+    2*(x*z+y*w),  2*(y*z-x*w),  1-2*(x*x+y*y),0,
+    0,0,0,1
+  ]);
+  for(let i=0;i<3;i++)for(let j=0;j<3;j++)rm[i*4+j]*=s[i];
+  rm[12]=t[0];rm[13]=t[1];rm[14]=t[2];
+  return rm;
+}
+function buildWorldMats(nodes) {
+  const local=nodes.map(trsToMat), world=new Array(nodes.length).fill(null);
+  const hasParent=new Set();
+  nodes.forEach(n=>(n.children||[]).forEach(c=>hasParent.add(c)));
+  function resolve(i,p){world[i]=p?m4.mul(p,local[i]):local[i];for(const c of(nodes[i].children||[]))resolve(c,world[i]);}
+  nodes.forEach((_,i)=>{if(!hasParent.has(i))resolve(i,null);});
+  return world;
+}
+
+// ── 状態 ─────────────────────────────────────────────────────
+let drawCalls=[], meshMats=[], boneVBO=null, boneCount=0;
+let showBones=false, vrmMeta={};
+
+// ── ロード ───────────────────────────────────────────────────
+async function init() {
+  try {
+    const {json,bin}=await loadGLB('./cc0_humanoid.vrm');
+    const nodes=json.nodes, world=buildWorldMats(nodes);
+    vrmMeta=json.extensions?.VRM?.meta||{};
+
+    // メッシュVBO/IBO
+    for(const mesh of json.meshes){
+      for(const prim of mesh.primitives){
+        const pos=getAccessor(json,bin,prim.attributes.POSITION);
+        const idx=getAccessor(json,bin,prim.indices);
+        const normals=new Float32Array(pos.length);
+        for(let i=0;i<idx.length;i+=3){
+          const i0=idx[i]*3,i1=idx[i+1]*3,i2=idx[i+2]*3;
+          const ax=pos[i1]-pos[i0],ay=pos[i1+1]-pos[i0+1],az=pos[i1+2]-pos[i0+2];
+          const bx=pos[i2]-pos[i0],by=pos[i2+1]-pos[i0+1],bz=pos[i2+2]-pos[i0+2];
+          const nx=ay*bz-az*by,ny=az*bx-ax*bz,nz=ax*by-ay*bx;
+          for(const vi of[idx[i],idx[i+1],idx[i+2]]){normals[vi*3]+=nx;normals[vi*3+1]+=ny;normals[vi*3+2]+=nz;}
+        }
+        const buf=new Float32Array(pos.length/3*6);
+        for(let i=0;i<pos.length/3;i++){
+          const nx=normals[i*3],ny=normals[i*3+1],nz=normals[i*3+2],l=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+          buf[i*6]=pos[i*3];buf[i*6+1]=pos[i*3+1];buf[i*6+2]=pos[i*3+2];
+          buf[i*6+3]=nx/l; buf[i*6+4]=ny/l;       buf[i*6+5]=nz/l;
+        }
+        const vbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vbo);gl.bufferData(gl.ARRAY_BUFFER,buf,gl.STATIC_DRAW);
+        const ibo=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ibo);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,idx,gl.STATIC_DRAW);
+        drawCalls.push({vbo,ibo,count:idx.length});
+      }
+    }
+
+    // メッシュノードのワールド行列
+    nodes.forEach((n,i)=>{ if(n.mesh!==undefined) meshMats.push({meshIdx:n.mesh,mat:world[i]||m4.id()}); });
+
+    // ボーン線分（ボーンノード間のみ）
+    const lines=[];
+    nodes.forEach((n,i)=>{
+      if(n.name?.startsWith('Mesh_')) return;
+      const w=world[i]; if(!w) return;
+      for(const c of(n.children||[])){
+        if(nodes[c].name?.startsWith('Mesh_')) continue;
+        const cw=world[c]; if(!cw) continue;
+        lines.push(w[12],w[13],w[14],cw[12],cw[13],cw[14]);
+      }
+    });
+    if(lines.length){
+      boneCount=lines.length/3;
+      boneVBO=gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER,boneVBO);
+      gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(lines),gl.STATIC_DRAW);
+    }
+
+    updateHUD();
+    render();
+  } catch(e) {
+    document.getElementById('err').innerHTML=
+      'Failed to load cc0_humanoid.vrm<br>'+e.message+
+      '<br><br>ローカルサーバー経由で開くか<br>同フォルダにVRMを置いてください';
+  }
+}
+
+// ── HUD ──────────────────────────────────────────────────────
+function updateHUD() {
+  document.getElementById('hud').innerHTML=
+    `<b>${vrmMeta.title||'CC0 Humanoid Base'}</b><br>`+
+    `Author: ${vrmMeta.author||'—'}<br>`+
+    `License: ${vrmMeta.licenseName||'CC0'}<br>`+
+    `Bones [B]: <b>${showBones?'ON':'OFF'}</b>`;
+}
+
+window.addEventListener('keydown',e=>{
+  if(e.key==='b'||e.key==='B'){ showBones=!showBones; updateHUD(); }
+});
+
+// ── カメラ ───────────────────────────────────────────────────
+let rotX=0,rotY=0,zoom=2.8,panX=0,panY=0,drag=false,rdrag=false,lastX=0,lastY=0;
+canvas.addEventListener('mousedown',e=>{ if(e.button===2)rdrag=true;else drag=true;lastX=e.clientX;lastY=e.clientY; });
+window.addEventListener('mouseup',()=>{drag=false;rdrag=false;});
+window.addEventListener('mousemove',e=>{
+  const dx=e.clientX-lastX,dy=e.clientY-lastY;
+  if(drag){rotY+=dx*0.005;rotX+=dy*0.005;} if(rdrag){panX+=dx*0.003;panY-=dy*0.003;}
+  lastX=e.clientX;lastY=e.clientY;
+});
+canvas.addEventListener('wheel',e=>{zoom=Math.max(0.5,Math.min(8,zoom+e.deltaY*0.005));e.preventDefault();},{passive:false});
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+
+let touches={};
+canvas.addEventListener('touchstart',e=>{[...e.changedTouches].forEach(t=>touches[t.identifier]={x:t.clientX,y:t.clientY});e.preventDefault();},{passive:false});
+canvas.addEventListener('touchmove',e=>{
+  const ids=Object.keys(touches).filter(k=>k!=='_pd');
+  if(ids.length===1){const t=e.changedTouches[0];rotY+=(t.clientX-touches[t.identifier].x)*0.005;rotX+=(t.clientY-touches[t.identifier].y)*0.005;touches[t.identifier]={x:t.clientX,y:t.clientY};}
+  else if(e.touches.length>=2){const p=e.touches,d=Math.hypot(p[0].clientX-p[1].clientX,p[0].clientY-p[1].clientY);if(touches._pd)zoom=Math.max(0.5,Math.min(8,zoom*touches._pd/d));touches._pd=d;}
+  e.preventDefault();
+},{passive:false});
+canvas.addEventListener('touchend',e=>{[...e.changedTouches].forEach(t=>delete touches[t.identifier]);if(Object.keys(touches).filter(k=>k!=='_pd').length<2)delete touches._pd;},{passive:false});
+
+// ── レンダリング ──────────────────────────────────────────────
+function render() {
+  requestAnimationFrame(render);
+  const w=canvas.clientWidth,h=canvas.clientHeight;
+  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;gl.viewport(0,0,w,h);}
+
+  gl.clearColor(0.53,0.53,0.53,1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+
+  const proj=m4.persp(0.6,w/h,0.01,100);
+  const view=m4.lookAt([panX,0.75+panY,zoom],[panX,0.75+panY,0],[0,1,0]);
+  const rot=m4.mul(m4.rotX(rotX),m4.rotY(rotY));
+  const vp=m4.mul(proj,view);
+  const ld=vn([1,1.5,1]);
+
+  // メッシュ
+  gl.useProgram(meshProg);
+  gl.uniform3f(mL.light,ld[0],ld[1],ld[2]);
+  gl.uniform3f(mL.color,0.85,0.85,0.88);
+  for(const {meshIdx,mat} of meshMats){
+    if(meshIdx>=drawCalls.length) continue;
+    const dc=drawCalls[meshIdx], model=m4.mul(rot,mat);
+    gl.uniformMatrix4fv(mL.mvp,false,m4.mul(vp,model));
+    gl.uniformMatrix4fv(mL.model,false,model);
+    gl.bindBuffer(gl.ARRAY_BUFFER,dc.vbo);
+    gl.enableVertexAttribArray(mL.pos);  gl.vertexAttribPointer(mL.pos, 3,gl.FLOAT,false,24,0);
+    gl.enableVertexAttribArray(mL.norm); gl.vertexAttribPointer(mL.norm,3,gl.FLOAT,false,24,12);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,dc.ibo);
+    gl.drawElements(gl.TRIANGLES,dc.count,gl.UNSIGNED_SHORT,0);
+  }
+
+  // ボーン（メッシュ内部にあるので深度テストを無効にして常に表示）
+  if(showBones&&boneVBO){
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(boneProg);
+    gl.uniformMatrix4fv(bL.mvp,false,m4.mul(vp,rot));
+    gl.uniform3f(bL.color,1.0,0.55,0.1);
+    gl.bindBuffer(gl.ARRAY_BUFFER,boneVBO);
+    gl.enableVertexAttribArray(bL.pos);
+    gl.vertexAttribPointer(bL.pos,3,gl.FLOAT,false,0,0);
+    gl.drawArrays(gl.LINES,0,boneCount);
+    gl.enable(gl.DEPTH_TEST);
+  }
+}
+
+init();
+</script>
+</body>
+</html>
